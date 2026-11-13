@@ -2352,3 +2352,173 @@ func TestEscapeMultipartFieldNamePreservesInvalidUTF8(t *testing.T) {
 		t.Errorf("escapeMultipartFieldName replaced invalid UTF-8 with U+FFFD: %q", escaped)
 	}
 }
+
+// newBodyLimitTestServer serves a highly compressible payload both as
+// plaintext (/plain) and gzip (/gzip). The gzip stream is deliberately far
+// smaller than MaxBodySize while its decompressed payload is far larger, so
+// that a wire-only limit would pass the compressed bytes but a decompression
+// bomb would slip through.
+func newBodyLimitTestServer(t *testing.T, plaintext []byte) *httptest.Server {
+	t.Helper()
+	var compressed bytes.Buffer
+	gw := gzip.NewWriter(&compressed)
+	if _, err := gw.Write(plaintext); err != nil {
+		t.Fatalf("gzip write: %v", err)
+	}
+	if err := gw.Close(); err != nil {
+		t.Fatalf("gzip close: %v", err)
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/plain", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		w.Write(plaintext)
+	})
+	mux.HandleFunc("/gzip", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		w.Header().Set("Content-Encoding", "gzip")
+		w.Write(compressed.Bytes())
+	})
+	return httptest.NewServer(mux)
+}
+
+// fetchBodyWithLimit visits path with the given MaxBodySize and optional
+// request headers, returning the body handed to OnResponse and failing the
+// test if the visit itself errors.
+func fetchBodyWithLimit(t *testing.T, ts *httptest.Server, path string, maxBodySize int, headers http.Header) []byte {
+	t.Helper()
+	c := NewCollector(MaxBodySize(maxBodySize))
+	if headers != nil {
+		c.Headers = &headers
+	}
+	var body []byte
+	c.OnResponse(func(resp *Response) {
+		body = append([]byte(nil), resp.Body...)
+	})
+	c.OnError(func(resp *Response, err error) {
+		t.Errorf("unexpected OnError for %s: %v", path, err)
+	})
+	if err := c.Visit(ts.URL + path); err != nil {
+		t.Fatalf("c.Visit(%s): %v", path, err)
+	}
+	return body
+}
+
+// TestMaxBodySizeGzipManualDecompressionBounded drives colly's own gzip
+// handling by explicitly advertising Accept-Encoding: gzip (so the
+// transport leaves the body compressed). The decompressed body must be
+// capped at MaxBodySize even though the compressed stream is well under it.
+func TestMaxBodySizeGzipManualDecompressionBounded(t *testing.T) {
+	const (
+		payloadSize = 512 * 1024 // decompressed payload
+		maxBodySize = 4096       // response body limit
+	)
+	plaintext := bytes.Repeat([]byte("A"), payloadSize)
+	ts := newBodyLimitTestServer(t, plaintext)
+	defer ts.Close()
+
+	var compressedSize int
+	func() {
+		// Sanity check: the wire payload must be smaller than the limit,
+		// otherwise the wire-side LimitReader alone would truncate it and
+		// this test would not prove decompression-side bounding.
+		req, _ := http.NewRequest(http.MethodGet, ts.URL+"/gzip", nil)
+		req.Header.Set("Accept-Encoding", "gzip")
+		res, err := http.DefaultTransport.RoundTrip(req)
+		if err != nil {
+			t.Fatalf("probe RoundTrip: %v", err)
+		}
+		defer res.Body.Close()
+		raw, err := io.ReadAll(res.Body)
+		if err != nil {
+			t.Fatalf("probe read: %v", err)
+		}
+		compressedSize = len(raw)
+	}()
+	if compressedSize >= maxBodySize {
+		t.Fatalf("compressed size %d must be smaller than MaxBodySize %d", compressedSize, maxBodySize)
+	}
+
+	hdr := http.Header{}
+	hdr.Set("Accept-Encoding", "gzip")
+	body := fetchBodyWithLimit(t, ts, "/gzip", maxBodySize, hdr)
+
+	if got, want := len(body), maxBodySize; got != want {
+		t.Errorf("decompressed body size = %d, want %d (payload=%d, compressed=%d)", got, want, payloadSize, compressedSize)
+	}
+	if !bytes.Equal(body, plaintext[:maxBodySize]) {
+		t.Errorf("decompressed body does not match the first %d bytes of the payload", maxBodySize)
+	}
+}
+
+// TestMaxBodySizeGzipTransportDecompressionBounded covers the default path
+// where no Accept-Encoding is set: Go's transport transparently
+// decompresses (res.Uncompressed == true) and colly skips its own gzip
+// reader. The same MaxBodySize must still apply to the decompressed bytes.
+func TestMaxBodySizeGzipTransportDecompressionBounded(t *testing.T) {
+	const (
+		payloadSize = 512 * 1024
+		maxBodySize = 4096
+	)
+	plaintext := bytes.Repeat([]byte("A"), payloadSize)
+	ts := newBodyLimitTestServer(t, plaintext)
+	defer ts.Close()
+
+	body := fetchBodyWithLimit(t, ts, "/gzip", maxBodySize, nil)
+
+	if got, want := len(body), maxBodySize; got != want {
+		t.Errorf("transport-decompressed body size = %d, want %d (payload=%d)", got, want, payloadSize)
+	}
+	if !bytes.Equal(body, plaintext[:maxBodySize]) {
+		t.Errorf("transport-decompressed body does not match the first %d bytes of the payload", maxBodySize)
+	}
+}
+
+// TestMaxBodySizeGzipMatchesPlaintext asserts the limit semantics are
+// identical regardless of compression: the same payload over /plain and
+// /gzip (both manual and transport decompression) yields the same
+// truncated length, matching the plaintext path.
+func TestMaxBodySizeGzipMatchesPlaintext(t *testing.T) {
+	const (
+		payloadSize = 512 * 1024
+		maxBodySize = 4096
+	)
+	plaintext := bytes.Repeat([]byte("A"), payloadSize)
+	ts := newBodyLimitTestServer(t, plaintext)
+	defer ts.Close()
+
+	plainBody := fetchBodyWithLimit(t, ts, "/plain", maxBodySize, nil)
+	if got, want := len(plainBody), maxBodySize; got != want {
+		t.Fatalf("plaintext body size = %d, want %d", got, want)
+	}
+
+	hdr := http.Header{}
+	hdr.Set("Accept-Encoding", "gzip")
+	manualGzipBody := fetchBodyWithLimit(t, ts, "/gzip", maxBodySize, hdr)
+	transportGzipBody := fetchBodyWithLimit(t, ts, "/gzip", maxBodySize, nil)
+
+	if !bytes.Equal(manualGzipBody, plainBody) {
+		t.Errorf("manual gzip body (%d bytes) does not match plaintext body (%d bytes)", len(manualGzipBody), len(plainBody))
+	}
+	if !bytes.Equal(transportGzipBody, plainBody) {
+		t.Errorf("transport gzip body (%d bytes) does not match plaintext body (%d bytes)", len(transportGzipBody), len(plainBody))
+	}
+}
+
+// TestMaxBodySizeGzipWithinLimit verifies a small compressed response whose
+// decompressed size stays under the limit is returned in full and
+// untouched, matching the plaintext behavior.
+func TestMaxBodySizeGzipWithinLimit(t *testing.T) {
+	const maxBodySize = 1024 * 1024
+	plaintext := []byte(testXML)
+	ts := newBodyLimitTestServer(t, plaintext)
+	defer ts.Close()
+
+	hdr := http.Header{}
+	hdr.Set("Accept-Encoding", "gzip")
+	body := fetchBodyWithLimit(t, ts, "/gzip", maxBodySize, hdr)
+
+	if !bytes.Equal(body, plaintext) {
+		t.Errorf("in-limit gzip body = %q, want %q", body, plaintext)
+	}
+}

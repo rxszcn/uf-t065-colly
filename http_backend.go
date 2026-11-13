@@ -233,6 +233,9 @@ func (h *httpBackend) Do(request *http.Request, bodySize int, checkRequestHeader
 
 	var bodyReader io.Reader = res.Body
 	if bodySize > 0 {
+		// Bound the number of bytes ever pulled from the wire. This covers
+		// uncompressed bodies and, for compressed bodies, caps the amount of
+		// compressed data consumed before decompression.
 		bodyReader = io.LimitReader(bodyReader, int64(bodySize))
 	}
 	contentEncoding := strings.ToLower(res.Header.Get("Content-Encoding"))
@@ -249,11 +252,21 @@ func (h *httpBackend) Do(request *http.Request, bodySize int, checkRequestHeader
 		case nil:
 			// gzip magic, as specified in RFC 1952
 			if magic[0] == 0x1f && magic[1] == 0x8b {
-				bodyReader, err = gzip.NewReader(bufReader)
+				gzReader, err := gzip.NewReader(bufReader)
 				if err != nil {
 					return nil, err
 				}
-				defer bodyReader.(*gzip.Reader).Close()
+				defer gzReader.Close()
+				bodyReader = gzReader
+				if bodySize > 0 {
+					// The wire-side limit above only bounds the compressed
+					// bytes, which can decompress to many times their size.
+					// Bound the decompressed output as well so a compression
+					// bomb cannot exhaust memory, and keep the semantics
+					// identical to the plaintext path: reading stops at
+					// bodySize bytes without surfacing an error.
+					bodyReader = io.LimitReader(gzReader, int64(bodySize))
+				}
 			}
 		default:
 			return nil, err
